@@ -2976,7 +2976,7 @@ namespace {
 		};
 	}
 
-	void torrent::announce_with_tracker(event_t e)
+	void torrent::announce_with_tracker(event_t e, bool const high_priority)
 	{
 		TORRENT_ASSERT(is_single_thread());
 		TORRENT_ASSERT(e == event_t::stopped || state() != torrent_status::checking_files);
@@ -3278,6 +3278,7 @@ namespace {
 							, print_endpoint(aep.local_endpoint).c_str());
 					}
 
+					if (high_priority) req.kind |= tracker_request::high_priority;
 					// if we're not logging session logs, don't bother creating an
 					// observer object just for logging
 					if (m_abort && m_ses.should_log())
@@ -3842,7 +3843,15 @@ namespace {
 			debug_log("*** found no tracker endpoints to announce");
 		}
 #endif
-		update_tracker_timer(aux::time_now32());
+
+		if (flags & torrent_handle::high_priority)
+		{
+			announce_with_tracker(event_t::none, true);
+		}
+		else
+		{
+			update_tracker_timer(aux::time_now32());
+		}
 	}
 
 #if TORRENT_ABI_VERSION == 1
@@ -10129,7 +10138,8 @@ namespace {
 
 		update_want_tick();
 
-		announce_with_tracker();
+		bool const high_priority = m_connect_boost_counter > 0;
+		announce_with_tracker(event_t::none, high_priority);
 
 		lsd_announce();
 	}
@@ -12350,7 +12360,8 @@ namespace {
 		if ((!m_abort && !is_paused() && state() != torrent_status::checking_files)
 			|| r.event == event_t::stopped)
 		{
-			announce_with_tracker(r.event);
+			// if the tracker that failed was high-priority, make the next attempt high priority as well
+			announce_with_tracker(r.event, (r.kind & torrent_handle::high_priority) != 0);
 		}
 		else
 		{
