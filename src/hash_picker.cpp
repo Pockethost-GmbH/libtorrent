@@ -282,6 +282,20 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		ret.hash_failed = std::move(results->failed);
 		ret.hash_passed = std::move(results->passed);
 
+		if (req.base == m_piece_layer)
+		{
+			int const total_pieces = m_files.file_num_pieces(req.file);
+			int const request_end = std::min(req.index + req.count, total_pieces);
+			int const start_bucket = req.index / 512;
+			int const end_bucket = (request_end + 511) / 512;
+			auto& file_requests = m_piece_hash_requested[req.file];
+			for (int bucket = start_bucket; bucket < end_bucket; ++bucket)
+			{
+				if (bucket < file_requests.end_index())
+					file_requests[bucket].have = true;
+			}
+		}
+
 		return ret;
 	}
 
