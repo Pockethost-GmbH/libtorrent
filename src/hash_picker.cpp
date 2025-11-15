@@ -100,20 +100,56 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		, m_piece_tree_root_layer(m_piece_layer + merkle_num_layers(512))
 	{
 		m_piece_hash_requested.resize(trees.size());
+		m_file_cache.resize(m_files.end_file());
 		for (file_index_t f(0); f != m_files.end_file(); ++f)
 		{
-			if (m_files.pad_file_at(f)) continue;
+			auto& cache = m_file_cache[f];
+			cache.pad_file = m_files.pad_file_at(f);
+			cache.size = m_files.file_size(f);
+			cache.first_piece = int(m_files.file_offset(f) / m_files.piece_length());
+			if (cache.pad_file || cache.size == 0)
+			{
+				cache.num_pieces = 0;
+				cache.num_blocks = 0;
+				cache.num_layers = 0;
+				cache.piece_tree_root_layer = 0;
+				cache.piece_tree_root_start = 0;
+				cache.piece_internal_layers = 0;
+				continue;
+			}
+
+			cache.num_pieces = m_files.file_num_pieces(f);
+			cache.num_blocks = m_files.file_num_blocks(f);
+			if (cache.num_blocks > 0)
+			{
+				cache.num_layers = merkle_num_layers(merkle_num_leafs(cache.num_blocks));
+				cache.piece_tree_root_layer = std::max(0, cache.num_layers - m_piece_tree_root_layer);
+				cache.piece_tree_root_start = merkle_layer_start(cache.piece_tree_root_layer);
+			}
+			else
+			{
+				cache.num_layers = 0;
+				cache.piece_tree_root_layer = 0;
+				cache.piece_tree_root_start = 0;
+			}
+			cache.piece_internal_layers = cache.num_pieces > 0
+				? merkle_num_layers(merkle_num_leafs(cache.num_pieces)) - 1
+				: 0;
+		}
+
+		for (file_index_t f(0); f != m_files.end_file(); ++f)
+		{
+			if (m_file_cache[f].pad_file) continue;
 
 			auto const& tree = m_merkle_trees[f];
 			auto const v = tree.verified_leafs();
 
-			if (m_files.file_size(f) <= m_files.piece_length())
+			if (m_file_cache[f].size <= m_files.piece_length())
 				continue;
 
-			m_piece_hash_requested[f].resize((m_files.file_num_pieces(f) + 511) / 512);
+			m_piece_hash_requested[f].resize((m_file_cache[f].num_pieces + 511) / 512);
 
-			int const piece_layer_idx = merkle_num_layers(
-				merkle_num_leafs(m_files.file_num_blocks(f))) - m_piece_layer;
+			int const piece_layer_idx = m_file_cache[f].num_layers - m_piece_layer;
 			int const piece_layer_start = merkle_layer_start(piece_layer_idx);
 
 			// check for hashes we already have and flag entries in m_piece_hash_requested
@@ -122,7 +158,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 			{
 				for (int j = i * 512;; ++j)
 				{
-					if (j == (i + 1) * 512 || j >= m_files.file_num_pieces(f))
+					if (j == (i + 1) * 512 || j >= m_file_cache[f].num_pieces)
 					{
 						m_piece_hash_requested[f][i].have = true;
 						break;
@@ -183,12 +219,13 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 		for (auto const fidx : m_piece_hash_requested.range())
 		{
-			if (m_files.pad_file_at(fidx) || m_files.file_size(fidx) == 0) continue;
+			auto const& cache = m_file_cache[fidx];
+			if (cache.pad_file || cache.size == 0) continue;
 
-			int const file_first_piece = int(m_files.file_offset(fidx) / m_files.piece_length());
-			int const num_layers = file_num_layers(fidx);
-			int const piece_tree_root_layer = std::max(0, num_layers - m_piece_tree_root_layer);
-			int const piece_tree_root_start = merkle_layer_start(piece_tree_root_layer);
+			int const file_first_piece = cache.first_piece;
+			int const num_layers = cache.num_layers;
+			int const piece_tree_root_layer = cache.piece_tree_root_layer;
+			int const piece_tree_root_start = cache.piece_tree_root_start;
 
 			int i = -1;
 			for (auto& r : m_piece_hash_requested[fidx])
@@ -202,7 +239,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 				}
 
 				bool have = false;
-				for (int p = i * 512; p < std::min<int>((i + 1) * 512, m_files.file_num_pieces(fidx)); ++p)
+				for (int p = i * 512; p < std::min((i + 1) * 512, cache.num_pieces); ++p)
 				{
 					if (pieces[piece_index_t{file_first_piece + p}])
 					{
@@ -224,7 +261,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 				return hash_request(fidx
 					, m_piece_layer
 					, i * 512
-					, std::min(512, merkle_num_leafs(int(m_files.file_num_pieces(fidx) - i * 512)))
+					, std::min(512, merkle_num_leafs(int(cache.num_pieces - i * 512)))
 					, layers_to_verify({ fidx, piece_tree_root }) + piece_tree_num_layers);
 			}
 		}
@@ -422,7 +459,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		if (idx.node == 0) return -1;
 
 		int layers = 0;
-		int const file_internal_layers = merkle_num_layers(merkle_num_leafs(m_files.file_num_pieces(idx.file))) - 1;
+		int const file_internal_layers = m_file_cache[idx.file].piece_internal_layers;
 		auto const& tree = m_merkle_trees[idx.file];
 
 		for (;;)
@@ -438,6 +475,6 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 	int hash_picker::file_num_layers(file_index_t const idx) const
 	{
-		return merkle_num_layers(merkle_num_leafs(m_files.file_num_blocks(idx)));
+		return m_file_cache[idx].num_layers;
 	}
 }

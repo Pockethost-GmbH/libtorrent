@@ -45,6 +45,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/index_range.hpp"
 #include <deque>
 #include <map>
+#include <cstdint>
 
 namespace libtorrent
 {
@@ -215,6 +216,21 @@ namespace libtorrent
 		// information about every 512-piece span of each file. We request hashes
 		// for 512 pieces at a time
 		aux::vector<aux::vector<piece_hash_request>, file_index_t> m_piece_hash_requested;
+
+		struct file_cache_entry
+		{
+			int first_piece = 0;
+			int num_pieces = 0;
+			int num_blocks = 0;
+			int num_layers = 0;
+			int piece_tree_root_layer = 0;
+			int piece_tree_root_start = 0;
+			int piece_internal_layers = 0;
+			std::int64_t size = 0;
+			bool pad_file = false;
+		};
+
+		aux::vector<file_cache_entry, file_index_t> m_file_cache;
 
 		// this is for a future per-block request feature
 #if 0
