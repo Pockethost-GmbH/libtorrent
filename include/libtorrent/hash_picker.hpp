@@ -171,6 +171,7 @@ namespace libtorrent
 		// returns the number of proof layers needed to verify the node's hash
 		int layers_to_verify(node_index idx) const;
 		int file_num_layers(file_index_t idx) const;
+		file_index_t next_file_index(file_index_t f) const;
 
 		struct piece_hash_request
 		{
@@ -231,6 +232,8 @@ namespace libtorrent
 		};
 
 		aux::vector<file_cache_entry, file_index_t> m_file_cache;
+		aux::vector<int, file_index_t> m_next_piece_bucket;
+		file_index_t m_next_file{file_index_t{0}};
 
 		// this is for a future per-block request feature
 #if 0

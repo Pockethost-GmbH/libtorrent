@@ -100,6 +100,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		, m_piece_tree_root_layer(m_piece_layer + merkle_num_layers(512))
 	{
 		m_piece_hash_requested.resize(trees.size());
+		m_next_piece_bucket.resize(m_files.end_file());
 		m_file_cache.resize(m_files.end_file());
 		for (file_index_t f(0); f != m_files.end_file(); ++f)
 		{
@@ -217,57 +218,76 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 			}
 		}
 
-		for (auto const fidx : m_piece_hash_requested.range())
+		if (m_piece_hash_requested.empty()) return {};
+
+		file_index_t const start_file = m_next_file;
+		bool first_file = true;
+		file_index_t file = start_file;
+
+		do
 		{
-			auto const& cache = m_file_cache[fidx];
-			if (cache.pad_file || cache.size == 0) continue;
-
-			int const file_first_piece = cache.first_piece;
-			int const num_layers = cache.num_layers;
-			int const piece_tree_root_layer = cache.piece_tree_root_layer;
-			int const piece_tree_root_start = cache.piece_tree_root_start;
-
-			int i = -1;
-			for (auto& r : m_piece_hash_requested[fidx])
+			auto const& cache = m_file_cache[file];
+			auto& file_requests = m_piece_hash_requested[file];
+			if (!cache.pad_file && cache.size > 0 && !file_requests.empty())
 			{
-				++i;
-				if (r.have ||
-					(r.last_request != min_time()
-					 && now - r.last_request < min_request_interval))
-				{
-					continue;
-				}
+				int& next_bucket = m_next_piece_bucket[file];
+				if (next_bucket >= file_requests.end_index()) next_bucket = 0;
+				int const bucket_count = file_requests.end_index();
+				int const start_bucket = next_bucket;
 
-				bool have = false;
-				for (int p = i * 512; p < std::min((i + 1) * 512, cache.num_pieces); ++p)
+				for (int bucket_iter = 0; bucket_iter < bucket_count; ++bucket_iter)
 				{
-					if (pieces[piece_index_t{file_first_piece + p}])
+					int const bucket = (start_bucket + bucket_iter) % bucket_count;
+					auto& r = file_requests[bucket];
+					if (!r.have &&
+						(r.last_request == min_time()
+							|| now - r.last_request >= min_request_interval))
 					{
-						have = true;
-						break;
+						bool have = false;
+						int const begin_piece = bucket * 512;
+						int const end_piece = std::min(begin_piece + 512, cache.num_pieces);
+						for (int p = begin_piece; p < end_piece; ++p)
+						{
+							if (pieces[piece_index_t{cache.first_piece + p}])
+							{
+								have = true;
+								break;
+							}
+						}
+
+						if (have)
+						{
+							int const piece_tree_root = cache.piece_tree_root_start + bucket;
+							++r.num_requests;
+							r.last_request = now;
+							int const piece_tree_num_layers
+								= cache.num_layers - cache.piece_tree_root_layer - m_piece_layer;
+
+							hash_request ret(file
+								, m_piece_layer
+								, begin_piece
+								, std::min(512, merkle_num_leafs(int(cache.num_pieces - begin_piece)))
+								, layers_to_verify({ file, piece_tree_root }) + piece_tree_num_layers);
+
+							m_next_piece_bucket[file] = (bucket + 1) % bucket_count;
+							m_next_file = next_file_index(file);
+							return ret;
+						}
 					}
 				}
 
-				if (!have) continue;
-
-				int const piece_tree_root = piece_tree_root_start + i;
-
-				++r.num_requests;
-				r.last_request = now;
-
-				int const piece_tree_num_layers
-					= num_layers - piece_tree_root_layer - m_piece_layer;
-
-				return hash_request(fidx
-					, m_piece_layer
-					, i * 512
-					, std::min(512, merkle_num_leafs(int(cache.num_pieces - i * 512)))
-					, layers_to_verify({ fidx, piece_tree_root }) + piece_tree_num_layers);
+				m_next_piece_bucket[file] = (start_bucket + 1) % bucket_count;
 			}
-		}
+
+			file = next_file_index(file);
+			if (!first_file && file == start_file) break;
+			first_file = false;
+		} while (true);
+
+		m_next_file = file;
 
 		return {};
-	}
+		}
 
 	add_hashes_result hash_picker::add_hashes(hash_request const& req, span<sha256_hash const> hashes)
 	{
@@ -476,5 +496,12 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 	int hash_picker::file_num_layers(file_index_t const idx) const
 	{
 		return m_file_cache[idx].num_layers;
+	}
+
+	file_index_t hash_picker::next_file_index(file_index_t f) const
+	{
+		++f;
+		if (f == m_files.end_file()) f = file_index_t{0};
+		return f;
 	}
 }
