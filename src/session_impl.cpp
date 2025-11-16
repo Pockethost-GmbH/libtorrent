@@ -4486,7 +4486,7 @@ namespace {
 		{
 			session_log("RECALCULATE UNCHOKE SLOTS: [ peers: %d "
 				"eligible-peers: %d"
-				" allowed-slots: %d ] libtorrent_xr 2"
+				" allowed-slots: %d ] libtorrent_xr 3"
 				, int(m_connections.size())
 				, int(peers.size())
 				, allowed_upload_slots);
