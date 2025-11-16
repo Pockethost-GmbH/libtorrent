@@ -183,6 +183,11 @@ namespace boost {
 }
 #endif
 
+namespace {
+constexpr char const version_log_suffix[] = "hash-picker-refactor branch";
+constexpr char const branch_name[] = "feature/hash-picker-work-queue";
+}
+
 namespace libtorrent {
 
 #if defined TORRENT_ASIO_DEBUGGING
@@ -684,8 +689,9 @@ bool ssl_server_name_callback(ssl::stream_handle_type stream_handle, std::string
 
 #ifndef TORRENT_DISABLE_LOGGING
 
-		session_log("version: %s revision: %" PRIx64
-			, lt::version_str, lt::version_revision);
+		session_log("version: %s revision: %" PRIx64 " %s %s"
+			, lt::version_str, lt::version_revision
+			, version_log_suffix, branch_name);
 
 #endif // TORRENT_DISABLE_LOGGING
 

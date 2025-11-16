@@ -45,6 +45,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/index_range.hpp"
 #include <deque>
 #include <map>
+#include <queue>
+#include <unordered_map>
 
 namespace libtorrent
 {
@@ -149,7 +151,8 @@ namespace libtorrent
 		hash_picker(file_storage const& files
 			, aux::vector<aux::merkle_tree, file_index_t>& trees);
 
-		hash_request pick_hashes(typed_bitfield<piece_index_t> const& pieces);
+		hash_request pick_hashes(typed_bitfield<piece_index_t> const& pieces
+			, torrent_peer* peer = nullptr);
 
 		add_hashes_result add_hashes(hash_request const& req, span<sha256_hash const> hashes);
 		// TODO: support batched adding of block hashes for reduced overhead?
@@ -164,6 +167,14 @@ namespace libtorrent
 		bool have_all() const;
 		bool piece_verified(piece_index_t piece) const;
 
+		void peer_has(piece_index_t index, torrent_peer* peer);
+		void peer_has(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer);
+		void peer_has_all(torrent_peer* peer);
+		void peer_lost(piece_index_t index, torrent_peer* peer);
+		void peer_lost(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer);
+		void peer_lost_all(torrent_peer* peer);
+		void remove_peer(torrent_peer* peer);
+
 		int piece_layer() const { return m_piece_layer; }
 
 	private:
@@ -171,11 +182,44 @@ namespace libtorrent
 		int layers_to_verify(node_index idx) const;
 		int file_num_layers(file_index_t idx) const;
 
+		struct bucket_queue_entry
+		{
+			file_index_t file;
+			int bucket;
+			std::uint32_t generation;
+		};
+
+		struct bucket_queue_compare
+		{
+			bool operator()(bucket_queue_entry const& lhs, bucket_queue_entry const& rhs) const
+			{
+				if (lhs.file == rhs.file) return lhs.bucket > rhs.bucket;
+				return lhs.file > rhs.file;
+			}
+		};
+
+		struct timed_bucket
+		{
+			time_point ready_time;
+			bucket_queue_entry entry;
+		};
+
+		struct timed_bucket_compare
+		{
+			bool operator()(timed_bucket const& lhs, timed_bucket const& rhs) const
+			{ return lhs.ready_time > rhs.ready_time; }
+		};
+
 		struct piece_hash_request
 		{
 			time_point last_request = min_time();
+			time_point next_request = min_time();
 			int num_requests = 0;
 			bool have = false;
+			bool pending = false;
+			bool queued = false;
+			std::uint16_t availability = 0;
+			std::uint32_t generation = 0;
 		};
 
 		struct priority_block_request
@@ -240,6 +284,35 @@ namespace libtorrent
 		// the granularity with which we send hash requests. The number of layers
 		// all the way down the the block level.
 		int const m_piece_tree_root_layer;
+
+		struct peer_state
+		{
+			aux::vector<std::vector<std::uint16_t>, file_index_t> bucket_counts;
+		};
+
+		piece_hash_request& bucket_state(file_index_t file, int bucket);
+		piece_hash_request const& bucket_state(file_index_t file, int bucket) const;
+		void update_ready_buckets(time_point now);
+		void enqueue_bucket(bucket_queue_entry const& entry);
+		void schedule_bucket(file_index_t file, int bucket, time_point ready, time_point now);
+		void reschedule_bucket(file_index_t file, int bucket, time_point ready, time_point now);
+		void cancel_bucket(file_index_t file, int bucket);
+		void activate_bucket(file_index_t file, int bucket, time_point ready, time_point now);
+		void complete_bucket(file_index_t file, int bucket);
+		bool bucket_for_piece(piece_index_t piece, file_index_t& file, int& bucket) const;
+		void add_piece_for_peer(piece_index_t piece, torrent_peer* peer, time_point now);
+		void remove_piece_for_peer(piece_index_t piece, torrent_peer* peer);
+		void inc_bucket_availability(file_index_t file, int bucket, time_point now);
+		void dec_bucket_availability(file_index_t file, int bucket);
+		bool peer_has_bucket(torrent_peer* peer, file_index_t file, int bucket) const;
+		peer_state& ensure_peer_state(torrent_peer* peer);
+		int bucket_piece_count(file_index_t file, int bucket) const;
+
+		std::priority_queue<bucket_queue_entry
+			, std::vector<bucket_queue_entry>
+			, bucket_queue_compare> m_bucket_queue;
+		std::priority_queue<timed_bucket, std::vector<timed_bucket>, timed_bucket_compare> m_waiting_buckets;
+		std::unordered_map<torrent_peer*, peer_state> m_peer_buckets;
 	};
 } // namespace libtorrent
 

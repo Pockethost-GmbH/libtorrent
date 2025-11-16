@@ -42,6 +42,7 @@ namespace libtorrent
 	namespace
 	{
 		time_duration const min_request_interval = seconds(3);
+		int const bucket_piece_span = 512;
 	}
 
 /*
@@ -136,8 +137,10 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		}
 	}
 
-	hash_request hash_picker::pick_hashes(typed_bitfield<piece_index_t> const& pieces)
+	hash_request hash_picker::pick_hashes(typed_bitfield<piece_index_t> const& pieces
+		, torrent_peer* peer)
 	{
+		TORRENT_UNUSED(pieces);
 		auto const now = aux::time_now();
 
 		// this is for a future per-block request feature
@@ -181,52 +184,58 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 			}
 		}
 
-		for (auto const fidx : m_piece_hash_requested.range())
-		{
-			if (m_files.pad_file_at(fidx) || m_files.file_size(fidx) == 0) continue;
+		if (peer == nullptr) return {};
 
-			int const file_first_piece = int(m_files.file_offset(fidx) / m_files.piece_length());
-			int const num_layers = file_num_layers(fidx);
+		update_ready_buckets(now);
+
+		if (m_peer_buckets.find(peer) == m_peer_buckets.end()) return {};
+
+		while (!m_bucket_queue.empty())
+		{
+			auto entry = m_bucket_queue.top();
+			m_bucket_queue.pop();
+
+			auto& state = bucket_state(entry.file, entry.bucket);
+			if (!state.queued || entry.generation != state.generation)
+				continue;
+			if (state.have || state.availability == 0)
+			{
+				cancel_bucket(entry.file, entry.bucket);
+				continue;
+			}
+			if (state.pending)
+				continue;
+			if (!peer_has_bucket(peer, entry.file, entry.bucket))
+			{
+				m_bucket_queue.push(entry);
+				continue;
+			}
+
+			state.queued = false;
+			state.pending = true;
+			state.last_request = now;
+			state.next_request = now + min_request_interval;
+			++state.num_requests;
+
+			schedule_bucket(entry.file, entry.bucket, state.next_request, now);
+
+			if (m_files.pad_file_at(entry.file) || m_files.file_size(entry.file) == 0)
+				continue;
+
+			int const num_layers = file_num_layers(entry.file);
 			int const piece_tree_root_layer = std::max(0, num_layers - m_piece_tree_root_layer);
 			int const piece_tree_root_start = merkle_layer_start(piece_tree_root_layer);
+			int const piece_tree_root = piece_tree_root_start + entry.bucket;
+			int const piece_tree_num_layers
+				= num_layers - piece_tree_root_layer - m_piece_layer;
 
-			int i = -1;
-			for (auto& r : m_piece_hash_requested[fidx])
-			{
-				++i;
-				if (r.have ||
-					(r.last_request != min_time()
-					 && now - r.last_request < min_request_interval))
-				{
-					continue;
-				}
+			int const remaining_pieces = int(m_files.file_num_pieces(entry.file) - entry.bucket * bucket_piece_span);
 
-				bool have = false;
-				for (int p = i * 512; p < std::min<int>((i + 1) * 512, m_files.file_num_pieces(fidx)); ++p)
-				{
-					if (pieces[piece_index_t{file_first_piece + p}])
-					{
-						have = true;
-						break;
-					}
-				}
-
-				if (!have) continue;
-
-				int const piece_tree_root = piece_tree_root_start + i;
-
-				++r.num_requests;
-				r.last_request = now;
-
-				int const piece_tree_num_layers
-					= num_layers - piece_tree_root_layer - m_piece_layer;
-
-				return hash_request(fidx
-					, m_piece_layer
-					, i * 512
-					, std::min(512, merkle_num_leafs(int(m_files.file_num_pieces(fidx) - i * 512)))
-					, layers_to_verify({ fidx, piece_tree_root }) + piece_tree_num_layers);
-			}
+			return hash_request(entry.file
+				, m_piece_layer
+				, entry.bucket * bucket_piece_span
+				, std::min(bucket_piece_span, merkle_num_leafs(remaining_pieces))
+				, layers_to_verify({ entry.file, piece_tree_root }) + piece_tree_num_layers);
 		}
 
 		return {};
@@ -282,6 +291,12 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		ret.hash_failed = std::move(results->failed);
 		ret.hash_passed = std::move(results->passed);
 
+		if (req.base == m_piece_layer)
+		{
+			TORRENT_ASSERT(req.index % bucket_piece_span == 0);
+			complete_bucket(req.file, req.index / bucket_piece_span);
+		}
+
 		return ret;
 	}
 
@@ -330,12 +345,19 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 	void hash_picker::hashes_rejected(hash_request const& req)
 	{
-		TORRENT_ASSERT(req.base == m_piece_layer && req.index % 512 == 0);
+		TORRENT_ASSERT(req.base == m_piece_layer && req.index % bucket_piece_span == 0);
 
-		for (int i = req.index; i < req.index + req.count; i += 512)
+		auto const now = aux::time_now();
+
+		for (int i = req.index; i < req.index + req.count; i += bucket_piece_span)
 		{
-			m_piece_hash_requested[req.file][i / 512].last_request = min_time();
-			--m_piece_hash_requested[req.file][i / 512].num_requests;
+			int const bucket = i / bucket_piece_span;
+			auto& state = bucket_state(req.file, bucket);
+			state.last_request = min_time();
+			state.pending = false;
+			if (state.num_requests > 0) --state.num_requests;
+			if (state.have || state.availability == 0) continue;
+			reschedule_bucket(req.file, bucket, now, now);
 		}
 
 		// this is for a future per-block request feature
@@ -355,6 +377,83 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 			}
 		}
 #endif
+	}
+
+	void hash_picker::peer_has(piece_index_t const index, torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		add_piece_for_peer(index, peer, aux::time_now());
+	}
+
+	void hash_picker::peer_has(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		auto const now = aux::time_now();
+		for (auto const piece : bits.range())
+		{
+			if (!bits[piece]) continue;
+			add_piece_for_peer(piece, peer, now);
+		}
+	}
+
+	void hash_picker::peer_has_all(torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		auto const now = aux::time_now();
+		auto& state = ensure_peer_state(peer);
+		for (auto const f : m_piece_hash_requested.range())
+		{
+			auto& counts = state.bucket_counts[f];
+			for (int bucket = 0; bucket < int(counts.size()); ++bucket)
+			{
+				std::uint16_t const new_count = std::uint16_t(bucket_piece_count(f, bucket));
+				if (new_count == 0) continue;
+				bool const had = counts[bucket] > 0;
+				counts[bucket] = new_count;
+				if (!had)
+					inc_bucket_availability(f, bucket, now);
+			}
+		}
+	}
+
+	void hash_picker::peer_lost(piece_index_t const index, torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		remove_piece_for_peer(index, peer);
+	}
+
+	void hash_picker::peer_lost(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		for (auto const piece : bits.range())
+		{
+			if (!bits[piece]) continue;
+			remove_piece_for_peer(piece, peer);
+		}
+	}
+
+	void hash_picker::peer_lost_all(torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		auto const it = m_peer_buckets.find(peer);
+		if (it == m_peer_buckets.end()) return;
+		for (auto const f : m_piece_hash_requested.range())
+		{
+			auto& counts = it->second.bucket_counts[f];
+			for (int bucket = 0; bucket < int(counts.size()); ++bucket)
+			{
+				if (counts[bucket] == 0) continue;
+				counts[bucket] = 0;
+				dec_bucket_availability(f, bucket);
+			}
+		}
+	}
+
+	void hash_picker::remove_peer(torrent_peer* peer)
+	{
+		if (peer == nullptr) return;
+		peer_lost_all(peer);
+		m_peer_buckets.erase(peer);
 	}
 
 	void hash_picker::verify_block_hashes(piece_index_t const index)
@@ -425,5 +524,189 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 	int hash_picker::file_num_layers(file_index_t const idx) const
 	{
 		return merkle_num_layers(merkle_num_leafs(m_files.file_num_blocks(idx)));
+	}
+
+	hash_picker::piece_hash_request& hash_picker::bucket_state(file_index_t const file, int const bucket)
+	{
+		TORRENT_ASSERT(bucket >= 0);
+		return m_piece_hash_requested[file][bucket];
+	}
+
+	hash_picker::piece_hash_request const& hash_picker::bucket_state(file_index_t const file, int const bucket) const
+	{
+		TORRENT_ASSERT(bucket >= 0);
+		return m_piece_hash_requested[file][bucket];
+	}
+
+	void hash_picker::update_ready_buckets(time_point const now)
+	{
+		while (!m_waiting_buckets.empty())
+		{
+			auto const tb = m_waiting_buckets.top();
+			if (tb.ready_time > now) break;
+			m_waiting_buckets.pop();
+
+			auto& state = bucket_state(tb.entry.file, tb.entry.bucket);
+			if (!state.queued || tb.entry.generation != state.generation)
+				continue;
+			if (state.have || state.availability == 0)
+			{
+				cancel_bucket(tb.entry.file, tb.entry.bucket);
+				continue;
+			}
+
+			state.pending = false;
+			enqueue_bucket(tb.entry);
+		}
+	}
+
+	void hash_picker::enqueue_bucket(bucket_queue_entry const& entry)
+	{
+		m_bucket_queue.push(entry);
+	}
+
+	void hash_picker::schedule_bucket(file_index_t const file, int const bucket
+		, time_point const ready, time_point const now)
+	{
+		auto& state = bucket_state(file, bucket);
+		++state.generation;
+		state.queued = true;
+		state.next_request = ready;
+		bucket_queue_entry entry{ file, bucket, state.generation };
+		if (ready <= now)
+			enqueue_bucket(entry);
+		else
+			m_waiting_buckets.push({ ready, entry });
+	}
+
+	void hash_picker::reschedule_bucket(file_index_t const file, int const bucket
+		, time_point const ready, time_point const now)
+	{
+		cancel_bucket(file, bucket);
+		schedule_bucket(file, bucket, ready, now);
+	}
+
+	void hash_picker::cancel_bucket(file_index_t const file, int const bucket)
+	{
+		auto& state = bucket_state(file, bucket);
+		if (!state.queued) return;
+		++state.generation;
+		state.queued = false;
+	}
+
+	void hash_picker::activate_bucket(file_index_t const file, int const bucket
+		, time_point const ready, time_point const now)
+	{
+		auto& state = bucket_state(file, bucket);
+		if (state.have || state.pending || state.availability == 0) return;
+		if (state.queued)
+		{
+			if (ready < state.next_request)
+				reschedule_bucket(file, bucket, ready, now);
+			return;
+		}
+		schedule_bucket(file, bucket, ready, now);
+	}
+
+	void hash_picker::complete_bucket(file_index_t const file, int const bucket)
+	{
+		auto& state = bucket_state(file, bucket);
+		state.have = true;
+		state.pending = false;
+		cancel_bucket(file, bucket);
+	}
+
+	bool hash_picker::bucket_for_piece(piece_index_t const piece
+		, file_index_t& file, int& bucket) const
+	{
+		file = m_files.file_index_at_piece(piece);
+		if (m_files.pad_file_at(file)) return false;
+		if (m_piece_hash_requested[file].empty()) return false;
+		auto const first_piece = m_files.piece_index_at_file(file);
+		auto const offset = static_cast<int>(piece - first_piece);
+		if (offset < 0) return false;
+		bucket = offset / bucket_piece_span;
+		if (bucket < 0 || bucket >= int(m_piece_hash_requested[file].size())) return false;
+		return true;
+	}
+
+	void hash_picker::add_piece_for_peer(piece_index_t const piece, torrent_peer* peer
+		, time_point const now)
+	{
+		file_index_t file;
+		int bucket;
+		if (!bucket_for_piece(piece, file, bucket)) return;
+		auto& state = ensure_peer_state(peer);
+		auto& counts = state.bucket_counts[file];
+		if (counts.empty())
+			counts.resize(m_piece_hash_requested[file].size());
+		std::uint16_t& slot = counts[bucket];
+		bool const had = slot > 0;
+		++slot;
+		if (!had)
+			inc_bucket_availability(file, bucket, now);
+	}
+
+	void hash_picker::remove_piece_for_peer(piece_index_t const piece, torrent_peer* peer)
+	{
+		auto const it = m_peer_buckets.find(peer);
+		if (it == m_peer_buckets.end()) return;
+		file_index_t file;
+		int bucket;
+		if (!bucket_for_piece(piece, file, bucket)) return;
+		auto& counts = it->second.bucket_counts[file];
+		if (bucket < 0 || bucket >= int(counts.size())) return;
+		if (counts[bucket] == 0) return;
+		--counts[bucket];
+		if (counts[bucket] == 0)
+			dec_bucket_availability(file, bucket);
+	}
+
+	void hash_picker::inc_bucket_availability(file_index_t const file, int const bucket
+		, time_point const now)
+	{
+		auto& state = bucket_state(file, bucket);
+		++state.availability;
+		if (state.availability == 1)
+			activate_bucket(file, bucket, now, now);
+	}
+
+	void hash_picker::dec_bucket_availability(file_index_t const file, int const bucket)
+	{
+		auto& state = bucket_state(file, bucket);
+		TORRENT_ASSERT(state.availability > 0);
+		--state.availability;
+		if (state.availability == 0)
+			cancel_bucket(file, bucket);
+	}
+
+	bool hash_picker::peer_has_bucket(torrent_peer* peer, file_index_t const file, int const bucket) const
+	{
+		auto const it = m_peer_buckets.find(peer);
+		if (it == m_peer_buckets.end()) return false;
+		auto const& counts = it->second.bucket_counts[file];
+		if (bucket < 0 || bucket >= int(counts.size())) return false;
+		return counts[bucket] > 0;
+	}
+
+	hash_picker::peer_state& hash_picker::ensure_peer_state(torrent_peer* peer)
+	{
+		auto ret = m_peer_buckets.emplace(peer, peer_state{});
+		auto& state = ret.first->second;
+		if (ret.second)
+		{
+			state.bucket_counts.resize(m_piece_hash_requested.size());
+			for (auto const f : m_piece_hash_requested.range())
+				state.bucket_counts[f].resize(m_piece_hash_requested[f].size());
+		}
+		return state;
+	}
+
+	int hash_picker::bucket_piece_count(file_index_t const file, int const bucket) const
+	{
+		int const pieces_in_file = int(m_files.file_num_pieces(file));
+		int const start = bucket * bucket_piece_span;
+		if (start >= pieces_in_file) return 0;
+		return std::min(bucket_piece_span, pieces_in_file - start);
 	}
 }

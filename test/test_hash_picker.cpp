@@ -38,6 +38,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/aux_/merkle.hpp"
 #include "libtorrent/hex.hpp"
 #include "libtorrent/disk_interface.hpp" // for default_block_size
+#include "libtorrent/torrent_peer.hpp"
 
 #include "test.hpp"
 #include "test_utils.hpp"
@@ -186,10 +187,14 @@ TORRENT_TEST(reject_piece_request)
 
 	typed_bitfield<piece_index_t> const pieces(4 * 512, true);
 
-	auto const picked = picker.pick_hashes(pieces);
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+	picker.peer_has(pieces, &peer);
+
+	auto const picked = picker.pick_hashes(pieces, &peer);
 	picker.hashes_rejected(picked);
 
-	auto const picked2 = picker.pick_hashes(pieces);
+	auto const picked2 = picker.pick_hashes(pieces, &peer);
 	TEST_CHECK(picked == picked2);
 }
 
@@ -550,9 +555,13 @@ TORRENT_TEST(only_pick_have_pieces)
 	pieces.set_bit(512_piece);
 	pieces.set_bit(1537_piece);
 
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+	picker.peer_has(pieces, &peer);
+
 	std::vector <hash_request> picked;
 	for (int i = 0; i < 3; ++i)
-		picked.push_back(picker.pick_hashes(pieces));
+		picked.push_back(picker.pick_hashes(pieces, &peer));
 	TEST_EQUAL(picked[0].file, 0_file);
 	TEST_EQUAL(picked[0].base, 0);
 	TEST_EQUAL(picked[0].count, 512);
@@ -635,4 +644,3 @@ TORRENT_TEST(validate_hash_request)
 	TEST_CHECK(validate_hash_request(hash_request(file_index_t{0}, 0, 0, 1, num_layers - 1), fs));
 	TEST_CHECK(validate_hash_request(hash_request(file_index_t{0}, 1, 0, 1, num_layers - 2), fs));
 }
-

@@ -1284,6 +1284,16 @@ bool is_downloading_state(int const st)
 
 		m_hash_picker.reset(new hash_picker(m_torrent_file->orig_files()
 			, m_merkle_trees));
+
+		for (auto const peer_conn : m_connections)
+		{
+			if (peer_conn->type() != connection_type::bittorrent) continue;
+			auto* const btpeer = static_cast<bt_peer_connection*>(peer_conn);
+			if (btpeer == nullptr) continue;
+			torrent_peer* const ti = btpeer->peer_info_struct();
+			if (ti == nullptr) continue;
+			m_hash_picker->peer_has(btpeer->get_bitfield(), ti);
+		}
 	}
 
 	struct piece_refcount
@@ -4789,6 +4799,12 @@ namespace {
 		{
 			TORRENT_ASSERT(is_seed() || !m_have_all);
 		}
+
+		if (m_hash_picker)
+		{
+			torrent_peer* const hp = peer->peer_info_struct();
+			if (hp) m_hash_picker->peer_has(index, hp);
+		}
 	}
 
 	// when we get a bitfield message, this is called for that piece
@@ -4805,6 +4821,12 @@ namespace {
 		{
 			TORRENT_ASSERT(is_seed() || !m_have_all);
 		}
+
+		if (m_hash_picker)
+		{
+			torrent_peer* const hp = peer->peer_info_struct();
+			if (hp) m_hash_picker->peer_has(bits, hp);
+		}
 	}
 
 	void torrent::peer_has_all(peer_connection const* peer)
@@ -4817,6 +4839,12 @@ namespace {
 		else
 		{
 			TORRENT_ASSERT(is_seed() || !m_have_all);
+		}
+
+		if (m_hash_picker)
+		{
+			torrent_peer* const hp = peer->peer_info_struct();
+			if (hp) m_hash_picker->peer_has_all(hp);
 		}
 	}
 
@@ -4833,6 +4861,12 @@ namespace {
 		{
 			TORRENT_ASSERT(is_seed() || !m_have_all);
 		}
+
+		if (m_hash_picker)
+		{
+			torrent_peer* const hp = peer->peer_info_struct();
+			if (hp) m_hash_picker->peer_lost(bits, hp);
+		}
 	}
 
 	void torrent::peer_lost(piece_index_t const index, peer_connection const* peer)
@@ -4845,6 +4879,12 @@ namespace {
 		else
 		{
 			TORRENT_ASSERT(is_seed() || !m_have_all);
+		}
+
+		if (m_hash_picker)
+		{
+			torrent_peer* const hp = peer->peer_info_struct();
+			if (hp) m_hash_picker->peer_lost(index, hp);
 		}
 	}
 
@@ -6862,7 +6902,7 @@ namespace {
 	{
 		need_hash_picker();
 		if (!m_hash_picker) return {};
-		return m_hash_picker->pick_hashes(peer->get_bitfield());
+		return m_hash_picker->pick_hashes(peer->get_bitfield(), peer->peer_info_struct());
 	}
 
 	std::vector<sha256_hash> torrent::get_hashes(hash_request const& req) const
@@ -11440,15 +11480,22 @@ namespace {
 	// so we don't leave then dangling
 	void torrent::peers_erased(std::vector<torrent_peer*> const& peers)
 	{
-		if (!has_picker()) return;
-
-		for (auto const p : peers)
+		if (has_picker())
 		{
-			m_picker->clear_peer(p);
-		}
+			for (auto const p : peers)
+			{
+				m_picker->clear_peer(p);
+			}
 #if TORRENT_USE_INVARIANT_CHECKS
-		m_picker->check_peers();
+			m_picker->check_peers();
 #endif
+		}
+
+		if (m_hash_picker)
+		{
+			for (auto const p : peers)
+				m_hash_picker->remove_peer(p);
+		}
 	}
 
 #if TORRENT_ABI_VERSION == 1
