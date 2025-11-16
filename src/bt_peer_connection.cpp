@@ -991,6 +991,7 @@ namespace {
 		piece_index_t const index(aux::read_int32(ptr));
 
 		incoming_have(index);
+		mark_hash_picker_dirty();
 		maybe_send_hash_request();
 	}
 
@@ -1026,6 +1027,8 @@ namespace {
 			, t->valid_metadata()?get_bitfield().size():(m_recv_buffer.packet_size()-1)*CHAR_BIT);
 
 		incoming_bitfield(bits);
+		mark_hash_picker_dirty();
+		maybe_send_hash_request();
 	}
 
 	// -----------------------------
@@ -1144,6 +1147,7 @@ namespace {
 		if (!m_recv_buffer.packet_finished()) return;
 
 		incoming_piece(p, recv_buffer.data() + header_size);
+		mark_hash_picker_dirty();
 		maybe_send_hash_request();
 	}
 
@@ -1304,8 +1308,8 @@ namespace {
 
 		if (!m_recv_buffer.packet_finished()) return;
 
-		auto new_end = std::remove(m_hash_requests.begin(), m_hash_requests.end(), hr);
-		m_hash_requests.erase(new_end, m_hash_requests.end());
+	auto new_end = std::remove(m_hash_requests.begin(), m_hash_requests.end(), hr);
+	m_hash_requests.erase(new_end, m_hash_requests.end());
 
 		std::vector<sha256_hash> hashes;
 		while (ptr != recv_buffer.end())
@@ -1323,14 +1327,15 @@ namespace {
 		}
 #endif
 
-		if (!t->add_hashes(hr, hashes))
-		{
-			disconnect(errors::invalid_hashes, operation_t::bittorrent, peer_connection_interface::peer_error);
-			return;
-		}
-
-		maybe_send_hash_request();
+	if (!t->add_hashes(hr, hashes))
+	{
+		disconnect(errors::invalid_hashes, operation_t::bittorrent, peer_connection_interface::peer_error);
+		return;
 	}
+
+	mark_hash_picker_dirty();
+	maybe_send_hash_request();
+}
 
 	void bt_peer_connection::on_hash_reject(int received)
 	{
@@ -1376,14 +1381,15 @@ namespace {
 		}
 #endif
 
-		auto new_end = std::remove(m_hash_requests.begin(), m_hash_requests.end(), hr);
-		if (new_end == m_hash_requests.end()) return;
-		m_hash_requests.erase(new_end, m_hash_requests.end());
+	auto new_end = std::remove(m_hash_requests.begin(), m_hash_requests.end(), hr);
+	if (new_end == m_hash_requests.end()) return;
+	m_hash_requests.erase(new_end, m_hash_requests.end());
 
-		t->hashes_rejected(hr);
+	t->hashes_rejected(hr);
 
-		maybe_send_hash_request();
-	}
+	mark_hash_picker_dirty();
+	maybe_send_hash_request();
+}
 
 	// -----------------------------
 	// --------- DHT PORT ----------
@@ -1450,6 +1456,7 @@ namespace {
 			return;
 		}
 		incoming_have_all();
+		mark_hash_picker_dirty();
 		maybe_send_hash_request();
 	}
 
@@ -1816,7 +1823,7 @@ namespace {
 		send_buffer(buf);
 	}
 
-	void bt_peer_connection::write_hash_reject(hash_request const& req, sha256_hash const& root)
+void bt_peer_connection::write_hash_reject(hash_request const& req, sha256_hash const& root)
 	{
 		INVARIANT_CHECK;
 
@@ -1845,7 +1852,14 @@ namespace {
 		}
 #endif
 
-		send_buffer(buf);
+	send_buffer(buf);
+}
+
+	void bt_peer_connection::mark_hash_picker_dirty()
+	{
+		if (!peer_info_struct()->protocol_v2) return;
+		m_hash_picker_dirty = true;
+		m_next_hash_request = min_time();
 	}
 
 	void bt_peer_connection::maybe_send_hash_request()
@@ -1853,13 +1867,35 @@ namespace {
 		if (is_disconnecting() || m_hash_requests.size() > 1) return;
 		if (!peer_info_struct()->protocol_v2) return;
 
+		auto const now = aux::time_now();
+		if (!m_hash_picker_dirty)
+		{
+			if (m_next_hash_request == min_time() || now >= m_next_hash_request)
+			{
+				m_hash_picker_dirty = true;
+			}
+			else
+			{
+				return;
+			}
+		}
+
 		std::shared_ptr<torrent> t = associated_torrent().lock();
 		TORRENT_ASSERT(t);
 
 		if (!t->valid_metadata()) return;
 
-		auto req = t->pick_hashes(this);
-		if (req.count > 0) write_hash_request(req);
+		while (m_hash_picker_dirty && m_hash_requests.size() <= 1)
+		{
+			auto req = t->pick_hashes(this);
+			if (req.count <= 0)
+			{
+				m_hash_picker_dirty = false;
+				m_next_hash_request = now + seconds(1);
+				return;
+			}
+			write_hash_request(req);
+		}
 	}
 
 	// -----------------------------

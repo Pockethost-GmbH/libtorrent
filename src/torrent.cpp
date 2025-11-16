@@ -6923,6 +6923,7 @@ namespace {
 		{
 			if (peer->type() != connection_type::bittorrent) continue;
 			auto* const btpeer = static_cast<bt_peer_connection*>(peer);
+			btpeer->mark_hash_picker_dirty();
 			btpeer->maybe_send_hash_request();
 		}
 	}
