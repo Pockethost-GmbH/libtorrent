@@ -4567,7 +4567,7 @@ namespace {
 		// first, build a set of all peers that participated
 		// if we know which blocks failed, just include the peer(s) sending those
 		// blocks
-		std::set<torrent_peer*> const peers = [&]
+		std::set<torrent_peer*> peers = [&]
 		{
 			std::set<torrent_peer*> ret;
 			if (!blocks.empty() && !downloaders.empty())
@@ -4580,6 +4580,20 @@ namespace {
 			}
 			return ret;
 		}();
+
+		// If web seeds are disabled from banning, drop any web_seed peers from the
+		// blame set so we don't log misleading bans or attempt to ban them. They still
+		// count as failed data for stats, but we won't mark them banned.
+		if (!settings().get_bool(settings_pack::ban_web_seeds))
+		{
+			for (auto it = peers.begin(); it != peers.end();)
+			{
+				if ((*it) != nullptr && (*it)->web_seed)
+					it = peers.erase(it);
+				else
+					++it;
+			}
+		}
 
 		// if this piece wasn't downloaded from peers, we just found it on disk.
 		// In that case, we should just consider it as "not-have" and there's no
