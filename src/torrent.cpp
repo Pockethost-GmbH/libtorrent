@@ -4605,7 +4605,16 @@ namespace {
 			// TODO: only do this if the piece size > 1 blocks
 			// This is a v2 torrent so we can request get block
 			// level hashes.
-			verify_block_hashes(index);
+
+			// DISABLED: Block-level hash request feature is incomplete in upstream libtorrent.
+			// The feature has no proper request lifecycle management, causing:
+			// - Crashes when processing hash rejections (fixed by defensive bounds in hash_picker.cpp)
+			// - Memory leaks (requests never removed from queue)
+			// - Infinite retry loops (rejected requests retry forever)
+			// - Invalid requests for last pieces (count exceeds remaining blocks)
+			// Falling back to BitTorrent v1 behavior: re-download entire piece on hash failure.
+			// This is slightly less bandwidth-efficient but proven stable.
+			// verify_block_hashes(index);
 		}
 
 		// the below code is penalizing peers that sent use bad data.

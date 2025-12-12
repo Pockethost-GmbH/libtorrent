@@ -5545,7 +5545,10 @@ namespace libtorrent {
 			TORRENT_ASSERT(m_disconnecting);
 			return;
 		case set_block_hash_result::piece_hash_failed:
-			t->verify_block_hashes(r.piece);
+			// DISABLED: Block-level hash request feature is incomplete (see torrent.cpp:4609).
+			// This case should never occur since we don't request block-level hashes above.
+			// If it somehow does occur, we simply break and let the piece fail naturally.
+			// t->verify_block_hashes(r.piece);
 			break;
 		case set_block_hash_result::success:
 		{

@@ -345,13 +345,22 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 	void hash_picker::hashes_rejected(hash_request const& req)
 	{
-		TORRENT_ASSERT(req.base == m_piece_layer && req.index % bucket_piece_span == 0);
+		// We only track piece-layer hash requests (512-piece buckets) in
+		// m_piece_hash_requested. Block-level rejections (base != m_piece_layer)
+		// or misaligned requests are not represented there, so bail out to avoid
+		// out-of-bounds access.
+		if (req.base != m_piece_layer || req.index % bucket_piece_span != 0)
+			return;
 
 		auto const now = aux::time_now();
 
 		for (int i = req.index; i < req.index + req.count; i += bucket_piece_span)
 		{
 			int const bucket = i / bucket_piece_span;
+			if (req.file < file_index_t(0) || req.file >= m_piece_hash_requested.end_index())
+				return;
+			if (bucket < 0 || bucket >= int(m_piece_hash_requested[req.file].size()))
+				return;
 			auto& state = bucket_state(req.file, bucket);
 			state.last_request = min_time();
 			state.pending = false;
