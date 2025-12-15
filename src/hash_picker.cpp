@@ -208,7 +208,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 			if (!peer_has_bucket(peer, entry.file, entry.bucket))
 			{
 				m_bucket_queue.push(entry);
-				continue;
+				break;
 			}
 
 			state.queued = false;
