@@ -177,7 +177,17 @@ namespace {
 		setup_receive();
 	}
 
-	bt_peer_connection::~bt_peer_connection() = default;
+	bt_peer_connection::~bt_peer_connection()
+	{
+		if (m_hash_requests.empty()) return;
+		auto t = associated_torrent().lock();
+		if (!t) return;
+		auto* pi = peer_info_struct();
+		if (!pi || !pi->protocol_v2) return;
+
+		for (auto const& req : m_hash_requests)
+			t->hashes_rejected(req);
+	}
 
 #if !defined TORRENT_DISABLE_ENCRYPTION
 	void bt_peer_connection::switch_send_crypto(std::shared_ptr<crypto_plugin> crypto)

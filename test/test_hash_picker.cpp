@@ -43,6 +43,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "test.hpp"
 #include "test_utils.hpp"
 
+#include <random>
+
 using namespace lt;
 
 #if 0
@@ -574,6 +576,317 @@ TORRENT_TEST(only_pick_have_pieces)
 	TEST_EQUAL(picked[1].proof_layers, 10);
 	TEST_EQUAL(picked[2].count, 0);
 }
+
+TORRENT_TEST(pending_clears_on_availability_drop)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+	picker.peer_has(pieces, &peer);
+
+	auto const picked = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked.count > 0);
+
+	picker.peer_lost_all(&peer);
+	picker.peer_has(pieces, &peer);
+
+	auto const picked2 = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked2.count > 0);
+}
+
+TORRENT_TEST(queue_scan_skips_unavailable_buckets)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces_peer0;
+	pieces_peer0.resize(2 * 512);
+	pieces_peer0.set_bit(0_piece);
+
+	typed_bitfield<piece_index_t> pieces_peer1;
+	pieces_peer1.resize(2 * 512);
+	pieces_peer1.set_bit(512_piece);
+
+	torrent_peer peer0(0, true, peer_source_flags_t{});
+	peer0.protocol_v2 = true;
+	torrent_peer peer1(0, true, peer_source_flags_t{});
+	peer1.protocol_v2 = true;
+
+	picker.peer_has(pieces_peer0, &peer0);
+	picker.peer_has(pieces_peer1, &peer1);
+
+	auto const picked = picker.pick_hashes(pieces_peer1, &peer1);
+	TEST_CHECK(picked.count > 0);
+	TEST_EQUAL(picked.index, 512);
+}
+
+#if TORRENT_USE_ASSERTS
+TORRENT_TEST(pick_hashes_respects_min_request_interval)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+	picker.peer_has(pieces, &peer);
+
+	auto const now = clock_type::now();
+	picker.set_time_override(now);
+
+	auto const picked = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked.count > 0);
+
+	auto const picked2 = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked2.count == 0);
+
+	picker.set_time_override(now + seconds(4));
+	auto const picked3 = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked3.count > 0);
+
+	picker.clear_time_override();
+}
+#endif
+
+#if TORRENT_USE_ASSERTS
+TORRENT_TEST(pending_timeout_requeues_bucket)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+	picker.peer_has(pieces, &peer);
+
+	auto const now = clock_type::now();
+	picker.set_time_override(now);
+
+	picker.force_pending_for_test(0_file, 0, now - picker.pending_timeout_for_test() - seconds(1));
+
+	auto const picked = picker.pick_hashes(pieces, &peer);
+	TEST_CHECK(picked.count > 0);
+	TEST_EQUAL(picked.index, 0);
+
+	picker.clear_time_override();
+}
+#endif
+
+TORRENT_TEST(availability_flap_keeps_progress)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+	pieces.set_bit(512_piece);
+
+	torrent_peer peer(0, true, peer_source_flags_t{});
+	peer.protocol_v2 = true;
+
+	bool got_requests = false;
+	for (int i = 0; i < 5; ++i)
+	{
+		picker.peer_has(pieces, &peer);
+		auto const picked = picker.pick_hashes(pieces, &peer);
+		if (picked.count > 0) got_requests = true;
+		picker.peer_lost_all(&peer);
+	}
+
+	TEST_CHECK(got_requests);
+}
+
+#if TORRENT_USE_ASSERTS
+TORRENT_TEST(randomized_availability_progress)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 4 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(4 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	std::mt19937 rng(0x9e3779b9);
+	std::uniform_int_distribution<int> coin(0, 1);
+
+	torrent_peer peers[3] = {
+		torrent_peer(0, true, peer_source_flags_t{}),
+		torrent_peer(0, true, peer_source_flags_t{}),
+		torrent_peer(0, true, peer_source_flags_t{})
+	};
+	for (auto& peer : peers) peer.protocol_v2 = true;
+
+	int total_requests = 0;
+	auto const base = clock_type::now();
+
+	for (int iter = 0; iter < 50; ++iter)
+	{
+		picker.set_time_override(base + seconds(iter * 10));
+
+		for (auto& peer : peers)
+		{
+			picker.peer_lost_all(&peer);
+
+			typed_bitfield<piece_index_t> pieces;
+			pieces.resize(4 * 512);
+			for (int bucket = 0; bucket < 4; ++bucket)
+			{
+				if (coin(rng) == 1)
+					pieces.set_bit(piece_index_t(bucket * 512));
+			}
+
+			picker.peer_has(pieces, &peer);
+			auto const picked = picker.pick_hashes(pieces, &peer);
+			if (picked.count > 0) ++total_requests;
+		}
+	}
+
+	picker.clear_time_override();
+	TEST_CHECK(total_requests > 0);
+}
+#endif
+
+#if TORRENT_USE_ASSERTS
+TORRENT_TEST(peer_remove_allows_requeue_after_timeout)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+
+	torrent_peer peer1(0, true, peer_source_flags_t{});
+	peer1.protocol_v2 = true;
+	torrent_peer peer2(0, true, peer_source_flags_t{});
+	peer2.protocol_v2 = true;
+
+	picker.peer_has(pieces, &peer1);
+	picker.peer_has(pieces, &peer2);
+
+	auto const now = clock_type::now();
+	picker.set_time_override(now);
+
+	auto const picked = picker.pick_hashes(pieces, &peer1);
+	TEST_CHECK(picked.count > 0);
+
+	picker.remove_peer(&peer1);
+
+	picker.set_time_override(now + picker.pending_timeout_for_test() + seconds(1));
+	auto const picked2 = picker.pick_hashes(pieces, &peer2);
+	TEST_CHECK(picked2.count > 0);
+	TEST_EQUAL(picked2.index, 0);
+
+	picker.clear_time_override();
+}
+#endif
+
+#if TORRENT_USE_ASSERTS
+TORRENT_TEST(disconnect_rejects_pending_requests)
+{
+	file_storage fs;
+	fs.set_piece_length(16 * 1024);
+
+	fs.add_file("test/tmp1", 2 * 512 * 16 * 1024);
+
+	aux::vector<aux::merkle_tree, file_index_t> trees;
+	sha256_hash root = from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+	trees.emplace_back(2 * 512, 1, root.data());
+
+	hash_picker picker(fs, trees);
+
+	typed_bitfield<piece_index_t> pieces;
+	pieces.resize(2 * 512);
+	pieces.set_bit(0_piece);
+
+	torrent_peer peer1(0, true, peer_source_flags_t{});
+	peer1.protocol_v2 = true;
+	torrent_peer peer2(0, true, peer_source_flags_t{});
+	peer2.protocol_v2 = true;
+
+	picker.peer_has(pieces, &peer1);
+	picker.peer_has(pieces, &peer2);
+
+	auto const now = clock_type::now();
+	picker.set_time_override(now);
+
+	auto const picked = picker.pick_hashes(pieces, &peer1);
+	TEST_CHECK(picked.count > 0);
+
+	picker.hashes_rejected(picked);
+
+	auto const picked2 = picker.pick_hashes(pieces, &peer2);
+	TEST_CHECK(picked2.count > 0);
+	TEST_EQUAL(picked2.index, 0);
+
+	picker.clear_time_override();
+}
+#endif
 
 TORRENT_TEST(validate_hash_request)
 {

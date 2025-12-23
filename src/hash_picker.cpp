@@ -42,6 +42,7 @@ namespace libtorrent
 	namespace
 	{
 		time_duration const min_request_interval = seconds(3);
+		time_duration const pending_timeout = seconds(30);
 		int const bucket_piece_span = 512;
 	}
 
@@ -137,11 +138,44 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		}
 	}
 
+	time_point hash_picker::now_time() const
+	{
+#if TORRENT_USE_ASSERTS
+		if (m_now_override != min_time()) return m_now_override;
+#endif
+		return aux::time_now();
+	}
+
+#if TORRENT_USE_ASSERTS
+	void hash_picker::set_time_override(time_point const now)
+	{
+		m_now_override = now;
+	}
+
+	void hash_picker::clear_time_override()
+	{
+		m_now_override = min_time();
+	}
+
+	time_duration hash_picker::pending_timeout_for_test() const
+	{
+		return pending_timeout;
+	}
+
+	void hash_picker::force_pending_for_test(file_index_t const file, int const bucket
+		, time_point const last_request)
+	{
+		auto& state = bucket_state(file, bucket);
+		state.pending = true;
+		state.last_request = last_request;
+	}
+#endif
+
 	hash_request hash_picker::pick_hashes(typed_bitfield<piece_index_t> const& pieces
 		, torrent_peer* peer)
 	{
 		TORRENT_UNUSED(pieces);
-		auto const now = aux::time_now();
+		auto const now = now_time();
 
 		// this is for a future per-block request feature
 #if 0
@@ -190,7 +224,11 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 		if (m_peer_buckets.find(peer) == m_peer_buckets.end()) return {};
 
-		while (!m_bucket_queue.empty())
+		int const queue_size = int(m_bucket_queue.size());
+		std::vector<bucket_queue_entry> skipped;
+		skipped.reserve(queue_size);
+
+		for (int scan = 0; scan < queue_size && !m_bucket_queue.empty(); ++scan)
 		{
 			auto entry = m_bucket_queue.top();
 			m_bucket_queue.pop();
@@ -204,10 +242,21 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 				continue;
 			}
 			if (state.pending)
-				continue;
+			{
+				if (state.last_request != min_time()
+					&& now - state.last_request > pending_timeout)
+				{
+					state.pending = false;
+				}
+				else
+				{
+					skipped.push_back(entry);
+					continue;
+				}
+			}
 			if (!peer_has_bucket(peer, entry.file, entry.bucket))
 			{
-				m_bucket_queue.push(entry);
+				skipped.push_back(entry);
 				continue;
 			}
 
@@ -231,12 +280,18 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 
 			int const remaining_pieces = int(m_files.file_num_pieces(entry.file) - entry.bucket * bucket_piece_span);
 
+			for (auto const& skipped_entry : skipped)
+				enqueue_bucket(skipped_entry);
+
 			return hash_request(entry.file
 				, m_piece_layer
 				, entry.bucket * bucket_piece_span
 				, std::min(bucket_piece_span, merkle_num_leafs(remaining_pieces))
 				, layers_to_verify({ entry.file, piece_tree_root }) + piece_tree_num_layers);
 		}
+
+		for (auto const& skipped_entry : skipped)
+			enqueue_bucket(skipped_entry);
 
 		return {};
 	}
@@ -352,7 +407,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		if (req.base != m_piece_layer || req.index % bucket_piece_span != 0)
 			return;
 
-		auto const now = aux::time_now();
+		auto const now = now_time();
 
 		for (int i = req.index; i < req.index + req.count; i += bucket_piece_span)
 		{
@@ -391,13 +446,13 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 	void hash_picker::peer_has(piece_index_t const index, torrent_peer* peer)
 	{
 		if (peer == nullptr) return;
-		add_piece_for_peer(index, peer, aux::time_now());
+		add_piece_for_peer(index, peer, now_time());
 	}
 
 	void hash_picker::peer_has(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer)
 	{
 		if (peer == nullptr) return;
-		auto const now = aux::time_now();
+		auto const now = now_time();
 		for (auto const piece : bits.range())
 		{
 			if (!bits[piece]) continue;
@@ -408,7 +463,7 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 	void hash_picker::peer_has_all(torrent_peer* peer)
 	{
 		if (peer == nullptr) return;
-		auto const now = aux::time_now();
+		auto const now = now_time();
 		auto& state = ensure_peer_state(peer);
 		for (auto const f : m_piece_hash_requested.range())
 		{
@@ -560,6 +615,8 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 				continue;
 			if (state.have || state.availability == 0)
 			{
+				if (state.availability == 0)
+					state.pending = false;
 				cancel_bucket(tb.entry.file, tb.entry.bucket);
 				continue;
 			}
@@ -607,7 +664,15 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		, time_point const ready, time_point const now)
 	{
 		auto& state = bucket_state(file, bucket);
-		if (state.have || state.pending || state.availability == 0) return;
+		if (state.have || state.availability == 0) return;
+		if (state.pending)
+		{
+			if (state.last_request != min_time()
+				&& now - state.last_request > pending_timeout)
+				state.pending = false;
+			else
+				return;
+		}
 		if (state.queued)
 		{
 			if (ready < state.next_request)
@@ -686,7 +751,10 @@ bool validate_hash_request(hash_request const& hr, file_storage const& fs)
 		TORRENT_ASSERT(state.availability > 0);
 		--state.availability;
 		if (state.availability == 0)
+		{
+			state.pending = false;
 			cancel_bucket(file, bucket);
+		}
 	}
 
 	bool hash_picker::peer_has_bucket(torrent_peer* peer, file_index_t const file, int const bucket) const

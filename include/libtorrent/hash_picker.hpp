@@ -167,6 +167,13 @@ namespace libtorrent
 		bool have_all() const;
 		bool piece_verified(piece_index_t piece) const;
 
+#if TORRENT_USE_ASSERTS
+		void set_time_override(time_point now);
+		void clear_time_override();
+		time_duration pending_timeout_for_test() const;
+		void force_pending_for_test(file_index_t file, int bucket, time_point last_request);
+#endif
+
 		void peer_has(piece_index_t index, torrent_peer* peer);
 		void peer_has(typed_bitfield<piece_index_t> const& bits, torrent_peer* peer);
 		void peer_has_all(torrent_peer* peer);
@@ -178,6 +185,8 @@ namespace libtorrent
 		int piece_layer() const { return m_piece_layer; }
 
 	private:
+		time_point now_time() const;
+
 		// returns the number of proof layers needed to verify the node's hash
 		int layers_to_verify(node_index idx) const;
 		int file_num_layers(file_index_t idx) const;
@@ -313,6 +322,10 @@ namespace libtorrent
 			, bucket_queue_compare> m_bucket_queue;
 		std::priority_queue<timed_bucket, std::vector<timed_bucket>, timed_bucket_compare> m_waiting_buckets;
 		std::unordered_map<torrent_peer*, peer_state> m_peer_buckets;
+
+#if TORRENT_USE_ASSERTS
+		time_point m_now_override = min_time();
+#endif
 	};
 } // namespace libtorrent
 
